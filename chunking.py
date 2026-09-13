@@ -1,129 +1,358 @@
-from pathlib import Path
 import re
+from pathlib import Path
 
 
-def split_sentences(text):
-    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+DEFAULT_CHUNK_SIZE = 800
+DEFAULT_OVERLAP = 120
 
 
-def split_words(text):
-    return text.split()
+def _split_sentences(text):
+    """
+    Split text into sentences while preserving readable boundaries.
+    """
+    text = re.sub(r"\s+", " ", text).strip()
 
+    if not text:
+        return []
 
-def merge_units(text, units, chunk_size, overlap):
-    chunks = []
-    current_text = ""
-    current_start = None
+    sentences = re.split(
+        r"(?<=[.!?])\s+",
+        text
+    )
 
-    for unit_text, unit_start, unit_end in units:
-        candidate = unit_text if not current_text else current_text + "\n\n" + unit_text
-
-        if len(candidate) <= chunk_size:
-            if current_start is None:
-                current_start = unit_start
-            current_text = candidate
-        else:
-            if current_text:
-                chunks.append((current_text, current_start,
-                               min(len(text), current_start + len(current_text))))
-
-            overlap_text = current_text[-overlap:] if overlap > 0 else ""
-            current_text = (overlap_text + "\n\n" + unit_text
-                            if overlap_text else unit_text)
-            current_start = max(0, unit_start - len(overlap_text))
-
-    if current_text:
-        chunks.append((current_text, current_start,
-                       min(len(text), current_start + len(current_text))))
-
-    return chunks
-
-
-def recursive_split(text, chunk_size, overlap):
-    if len(text) <= chunk_size:
-        return [(text, 0, len(text))]
-
-    paragraphs = re.split(r"\n\s*\n", text)
-
-    if len(paragraphs) > 1:
-        units = []
-        cursor = 0
-        for paragraph in paragraphs:
-            start = text.find(paragraph, cursor)
-            end = start + len(paragraph)
-            units.append((paragraph, start, end))
-            cursor = end
-        return merge_units(text, units, chunk_size, overlap)
-
-    sentences = split_sentences(text)
-
-    if len(sentences) > 1:
-        units = []
-        cursor = 0
-        for sentence in sentences:
-            start = text.find(sentence, cursor)
-            end = start + len(sentence)
-            units.append((sentence, start, end))
-            cursor = end
-        return merge_units(text, units, chunk_size, overlap)
-
-    words = split_words(text)
-    chunks = []
-    current_words = []
-    current_start = 0
-    cursor = 0
-
-    for word in words:
-        word_start = text.find(word, cursor)
-        word_end = word_start + len(word)
-        candidate = " ".join(current_words + [word])
-
-        if len(candidate) <= chunk_size:
-            current_words.append(word)
-        else:
-            if current_words:
-                chunks.append((" ".join(current_words), current_start, word_start))
-
-            overlap_words = current_words[-max(1, overlap // 10):] if overlap > 0 else []
-            overlap_text = " ".join(overlap_words)
-            current_words = overlap_words.copy()
-            current_start = max(0, word_start - len(overlap_text))
-            current_words.append(word)
-
-        cursor = word_end
-
-    if current_words:
-        chunks.append((" ".join(current_words), current_start, len(text)))
-
-    return chunks
-
-
-def chunk_document(text, source_doc, chunk_size=1000, overlap=150):
     return [
-        {
-            "chunk_id": f"{Path(source_doc).stem}_{i}",
-            "text": chunk_text,
-            "source_doc": source_doc,
-            "char_start": start,
-            "char_end": end,
-        }
-        for i, (chunk_text, start, end)
-        in enumerate(recursive_split(text, chunk_size, overlap))
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip()
     ]
 
 
-def chunk_folder(folder_path, chunk_size=1000, overlap=150):
-    chunks = []
+def _split_words(text, chunk_size):
+    """
+    Word-level fallback for very large sentences.
+    """
+    words = text.split()
 
-    for path in sorted(Path(folder_path).glob("*.txt")):
-        text = path.read_text(encoding="utf-8")
-        chunks.extend(chunk_document(text, path.name, chunk_size, overlap))
+    chunks = []
+    current = []
+
+    for word in words:
+
+        candidate = " ".join(current + [word])
+
+        if len(candidate) <= chunk_size:
+            current.append(word)
+
+        else:
+            if current:
+                chunks.append(" ".join(current))
+
+            current = [word]
+
+    if current:
+        chunks.append(" ".join(current))
 
     return chunks
 
 
-if __name__ == "__main__":
-    chunks = chunk_folder("data/documents")
-    print(f"Created {len(chunks)} chunks.")
-    for chunk in chunks[:3]:
-        print(chunk)
+def _recursive_split(
+    text,
+    chunk_size=DEFAULT_CHUNK_SIZE
+):
+    """
+    Structure-aware recursive splitting:
+
+    paragraph
+        ↓
+    sentence
+        ↓
+    word fallback
+    """
+
+    text = text.strip()
+
+    if not text:
+        return []
+
+    if len(text) <= chunk_size:
+        return [text]
+
+    # --------------------------------------------------------
+    # First: paragraphs
+    # --------------------------------------------------------
+
+    paragraphs = re.split(
+        r"\n\s*\n+",
+        text
+    )
+
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in paragraphs
+        if paragraph.strip()
+    ]
+
+    chunks = []
+    current = ""
+
+    for paragraph in paragraphs:
+
+        candidate = (
+            paragraph
+            if not current
+            else current + "\n\n" + paragraph
+        )
+
+        if len(candidate) <= chunk_size:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        # ----------------------------------------------------
+        # Paragraph itself is too large → sentences
+        # ----------------------------------------------------
+
+        if len(paragraph) <= chunk_size:
+            current = paragraph
+            continue
+
+        sentences = _split_sentences(paragraph)
+
+        sentence_buffer = ""
+
+        for sentence in sentences:
+
+            candidate = (
+                sentence
+                if not sentence_buffer
+                else sentence_buffer + " " + sentence
+            )
+
+            if len(candidate) <= chunk_size:
+                sentence_buffer = candidate
+
+            else:
+
+                if sentence_buffer:
+                    chunks.append(sentence_buffer)
+
+                sentence_buffer = ""
+
+                # ------------------------------------------------
+                # Sentence itself is too large → words
+                # ------------------------------------------------
+
+                if len(sentence) > chunk_size:
+                    word_chunks = _split_words(
+                        sentence,
+                        chunk_size
+                    )
+
+                    chunks.extend(word_chunks)
+
+                else:
+                    sentence_buffer = sentence
+
+        if sentence_buffer:
+            current = sentence_buffer
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def _add_overlap(chunks, overlap):
+    """
+    Add character-based overlap between consecutive chunks.
+    """
+
+    if not chunks:
+        return []
+
+    if overlap <= 0:
+        return chunks
+
+    result = []
+
+    for i, chunk in enumerate(chunks):
+
+        if i == 0:
+            result.append(chunk)
+            continue
+
+        previous = chunks[i - 1]
+
+        overlap_text = previous[-overlap:]
+
+        combined = (
+            overlap_text.rstrip()
+            + "\n"
+            + chunk.lstrip()
+        )
+
+        result.append(combined)
+
+    return result
+
+
+def chunk_text(
+    text,
+    chunk_size=DEFAULT_CHUNK_SIZE,
+    overlap=DEFAULT_OVERLAP
+):
+    """
+    Chunk a single document into structure-aware chunks.
+    """
+
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+
+    if chunk_size <= 0:
+        raise ValueError(
+            "chunk_size must be greater than 0"
+        )
+
+    if overlap < 0:
+        raise ValueError(
+            "overlap cannot be negative"
+        )
+
+    if overlap >= chunk_size:
+        raise ValueError(
+            "overlap must be smaller than chunk_size"
+        )
+
+    raw_chunks = _recursive_split(
+        text,
+        chunk_size=chunk_size
+    )
+
+    return _add_overlap(
+        raw_chunks,
+        overlap=overlap
+    )
+
+
+def chunk_documents(
+    documents,
+    chunk_size=DEFAULT_CHUNK_SIZE,
+    overlap=DEFAULT_OVERLAP
+):
+    """
+    Chunk multiple documents.
+
+    Expected input:
+
+        [
+            {
+                "text": "...",
+                "source_doc": "sample.txt"
+            }
+        ]
+
+    Returns:
+
+        [
+            {
+                "chunk_id": "chunk_0001",
+                "text": "...",
+                "source_doc": "sample.txt",
+                "char_start": 0,
+                "char_end": 800
+            }
+        ]
+    """
+
+    all_chunks = []
+
+    for document in documents:
+
+        text = document.get("text", "")
+        source_doc = document.get(
+            "source_doc",
+            "unknown"
+        )
+
+        if not text:
+            continue
+
+        raw_chunks = chunk_text(
+            text,
+            chunk_size=chunk_size,
+            overlap=overlap
+        )
+
+        search_position = 0
+
+        for raw_chunk in raw_chunks:
+
+            # Locate the chunk in the original document.
+            clean_chunk = raw_chunk.strip()
+
+            char_start = text.find(
+                clean_chunk,
+                search_position
+            )
+
+            if char_start == -1:
+                char_start = search_position
+
+            char_end = char_start + len(clean_chunk)
+
+            all_chunks.append(
+                {
+                    "chunk_id": (
+                        f"chunk_{len(all_chunks) + 1:04d}"
+                    ),
+                    "text": clean_chunk,
+                    "source_doc": source_doc,
+                    "char_start": char_start,
+                    "char_end": char_end,
+                }
+            )
+
+            search_position = min(
+                char_end,
+                len(text)
+            )
+
+    return all_chunks
+
+
+def chunk_directory(
+    directory,
+    chunk_size=DEFAULT_CHUNK_SIZE,
+    overlap=DEFAULT_OVERLAP
+):
+    """
+    Convenience function for chunking every .txt file
+    inside a directory.
+    """
+
+    directory = Path(directory)
+
+    documents = []
+
+    for file_path in sorted(directory.glob("*.txt")):
+
+        text = file_path.read_text(
+            encoding="utf-8",
+            errors="ignore"
+        )
+
+        documents.append(
+            {
+                "text": text,
+                "source_doc": file_path.name,
+            }
+        )
+
+    return chunk_documents(
+        documents,
+        chunk_size=chunk_size,
+        overlap=overlap
+    )
